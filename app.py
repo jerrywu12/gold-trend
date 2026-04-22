@@ -22,6 +22,7 @@ import json
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from io import StringIO
 
@@ -67,12 +68,12 @@ h1 { padding-top: 0 !important; }
 # =====================================================================
 # Robust HTTP fetch with retries + exponential backoff
 # =====================================================================
-def _http_get(url: str, timeout: int = 60, retries: int = 4,
+def _http_get(url: str, timeout: int = 20, retries: int = 2,
               headers: dict | None = None) -> str:
     """
-    GET a URL with retries. Handles transient timeouts, 5xx errors,
-    and connection failures with exponential backoff (1s, 2s, 4s).
-    Raises the last exception if all retries fail.
+    GET a URL with retries. Handles transient timeouts and 5xx errors
+    with exponential backoff (1s, 2s). Raises on permanent failure.
+    Kept short (20s / 2 retries) so cloud deploys don't hang.
     """
     req = urllib.request.Request(
         url, headers=headers or {"User-Agent": "Mozilla/5.0"}
@@ -97,13 +98,31 @@ def _http_get(url: str, timeout: int = 60, retries: int = 4,
 # =====================================================================
 # Cached data fetchers
 # =====================================================================
+# =====================================================================
+# Cached data fetchers
+# =====================================================================
+
+# All price-only tickers batched into a single yfinance call
+_PRICE_TICKERS = ["GC=F", "DX-Y.NYB", "SPY", "BTC-USD", "SI=F", "HG=F"]
+
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_yf(ticker: str, start: str = "2010-01-01") -> pd.DataFrame:
-    """yfinance OHLCV download, multi-index columns flattened. Cached 1h."""
-    df = yf.download(
-        ticker, start=start,
+def fetch_all_closes(start: str = "2010-01-01") -> pd.DataFrame:
+    """Batch-download Close prices for all tickers in one network call."""
+    raw = yf.download(
+        _PRICE_TICKERS, start=start,
         end=datetime.today().strftime("%Y-%m-%d"),
-        progress=False, auto_adjust=True,
+        auto_adjust=True, progress=False, threads=True,
+    )
+    return raw["Close"]
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_gld(start: str = "2010-01-01") -> pd.DataFrame:
+    """GLD full OHLCV (needed for volume chart)."""
+    df = yf.download(
+        "GLD", start=start,
+        end=datetime.today().strftime("%Y-%m-%d"),
+        auto_adjust=True, progress=False,
     )
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
@@ -112,19 +131,15 @@ def fetch_yf(ticker: str, start: str = "2010-01-01") -> pd.DataFrame:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_fred(series_id: str) -> pd.Series:
-    """FRED public CSV endpoint with retries. Returns empty Series on failure."""
+    """FRED public CSV with retries. Returns empty Series on failure."""
     url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
     try:
-        txt = _http_get(url, timeout=60, retries=4)
+        txt = _http_get(url)
         df = pd.read_csv(StringIO(txt), parse_dates=[0], na_values=".")
         df.columns = ["date", series_id]
         return df.dropna().set_index("date")[series_id]
     except Exception as e:
-        st.warning(
-            f"FRED series **{series_id}** unavailable ({type(e).__name__}). "
-            "The chart will still render using price data — click Refresh "
-            "in a moment to retry."
-        )
+        print(f"FRED {series_id} failed: {e}")   # visible in Streamlit Cloud logs
         return pd.Series(dtype=float, name=series_id)
 
 
@@ -137,7 +152,7 @@ def fetch_cftc(commodity: str = "GOLD", limit: int = 400) -> pd.DataFrame:
         f"&commodity_name={commodity}"
     )
     try:
-        txt = _http_get(url, timeout=60, retries=4)
+        txt = _http_get(url)
         data = json.loads(txt)
         if not data:
             return pd.DataFrame()
@@ -149,10 +164,7 @@ def fetch_cftc(commodity: str = "GOLD", limit: int = 400) -> pd.DataFrame:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
         return df
     except Exception as e:
-        st.warning(
-            f"CFTC COT report unavailable ({type(e).__name__}). "
-            "Positioning chart will be skipped — click Refresh shortly."
-        )
+        print(f"CFTC failed: {e}")
         return pd.DataFrame()
 
 
@@ -222,19 +234,39 @@ with st.sidebar:
 # Load data
 # =====================================================================
 with st.spinner("Loading data…"):
-    gold = fetch_yf("GC=F")["Close"].rename("Gold")
-    dxy = fetch_yf("DX-Y.NYB")["Close"].rename("DXY")
-    spy = fetch_yf("SPY")["Close"].rename("SPY")
-    btc = fetch_yf("BTC-USD")["Close"].rename("BTC")
-    silver = fetch_yf("SI=F")["Close"].rename("Silver")
-    copper = fetch_yf("HG=F")["Close"].rename("Copper")
-    gld = fetch_yf("GLD")
+    # --- Prices: one batch yfinance call instead of 6 separate ones ---
+    closes = fetch_all_closes()
+    gld = fetch_gld()
 
-    real_yield = fetch_fred("DFII10").rename("Real_10Y")
-    cpi = fetch_fred("CPIAUCSL").rename("CPI")
-    breakeven = fetch_fred("T10YIE").rename("Breakeven_10Y")
+    # --- Macro + COT: 4 calls fired in parallel ---
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        f_ry  = pool.submit(fetch_fred, "DFII10")
+        f_cpi = pool.submit(fetch_fred, "CPIAUCSL")
+        f_be  = pool.submit(fetch_fred, "T10YIE")
+        f_cot = pool.submit(fetch_cftc, "GOLD")
 
-    cot = fetch_cftc("GOLD")
+    real_yield = f_ry.result().rename("Real_10Y")
+    cpi        = f_cpi.result().rename("CPI")
+    breakeven  = f_be.result().rename("Breakeven_10Y")
+    cot        = f_cot.result()
+
+    # --- Extract individual series from batch Close DataFrame ---
+    gold   = closes["GC=F"].rename("Gold").dropna()
+    dxy    = closes["DX-Y.NYB"].rename("DXY").dropna()
+    spy    = closes["SPY"].rename("SPY").dropna()
+    btc    = closes["BTC-USD"].rename("BTC").dropna()
+    silver = closes["SI=F"].rename("Silver").dropna()
+    copper = closes["HG=F"].rename("Copper").dropna()
+
+# Surface any FRED/CFTC failures now that we're back on the main thread
+if real_yield.empty:
+    st.warning("10Y Real Yield (FRED DFII10) unavailable — macro charts will be partial. Try Refresh.")
+if cpi.empty:
+    st.warning("CPI (FRED CPIAUCSL) unavailable — macro charts will be partial. Try Refresh.")
+if breakeven.empty:
+    st.warning("Breakeven inflation (FRED T10YIE) unavailable. Try Refresh.")
+if cot.empty:
+    st.warning("CFTC COT data unavailable — positioning chart will be skipped. Try Refresh.")
 
 if gold.empty:
     st.error("Could not load gold price data from yfinance. "
